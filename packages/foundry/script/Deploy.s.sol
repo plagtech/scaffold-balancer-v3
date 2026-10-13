@@ -7,6 +7,7 @@ import { DeployMockTokens } from "./00_DeployMockTokens.s.sol";
 import { DeployConstantSumPool } from "./01_DeployConstantSumPool.s.sol";
 import { DeployConstantProductPool } from "./02_DeployConstantProductPool.s.sol";
 import { DeployWeightedPool8020 } from "./03_DeployWeightedPool8020.s.sol";
+import { DeployBatchDistributePool } from "./04_DeployBatchDistributePool.s.sol";
 
 /**
  * @title Deploy Script
@@ -18,7 +19,8 @@ contract DeployScript is
     DeployMockTokens,
     DeployConstantSumPool,
     DeployConstantProductPool,
-    DeployWeightedPool8020
+    DeployWeightedPool8020,
+    DeployBatchDistributePool
 {
     function run() external scaffoldExport {
         // Deploy mock tokens to use for the pools and hooks
@@ -32,6 +34,9 @@ contract DeployScript is
 
         // Deploy, register, and initialize a weighted pool with an exit fee hook
         deployWeightedPool8020(mockToken1, mockToken2);
+
+        // Deploy, register, and initialize a pool with a batch distribute hook (Spraay)
+        deployBatchDistributePool(mockToken1, mockToken2);
     }
 
     modifier scaffoldExport() {

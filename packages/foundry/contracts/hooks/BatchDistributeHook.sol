@@ -1,0 +1,265 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+pragma solidity ^0.8.24;
+
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+import { IHooks } from "@balancer-labs/v3-interfaces/contracts/vault/IHooks.sol";
+import { IVault } from "@balancer-labs/v3-interfaces/contracts/vault/IVault.sol";
+import {
+    HookFlags,
+    LiquidityManagement,
+    TokenConfig
+} from "@balancer-labs/v3-interfaces/contracts/vault/VaultTypes.sol";
+import { BaseHooks } from "@balancer-labs/v3-vault/contracts/BaseHooks.sol";
+import { VaultGuard } from "@balancer-labs/v3-vault/contracts/VaultGuard.sol";
+
+import { ISpraay } from "../interfaces/ISpraay.sol";
+
+/// @notice BatchDistributeHook lets the operators of Balancer v3 pools that use this hook
+/// push-distribute tokens (rewards, incentives, airdrops, revenue shares) to up to 200
+/// recipients in a single transaction, by routing the transfer through Spraay's on-chain
+/// batch contract (https://spraay.app).
+///
+/// Balancer v3's existing reward flows are pull-based (gauge rewards, veBAL). This hook
+/// complements them with a push model: the operator decides the recipient list off-chain
+/// and delivers everything in one call, with no claim step for the recipients.
+///
+/// Funding model: the hook is non-custodial. Each distribution pulls exactly
+/// `amount + Spraay fee` from the calling operator (ERC-20 via transferFrom, native via
+/// msg.value), approves Spraay for exactly that amount and calls it in the same transaction.
+/// Excess native currency is refunded to the operator.
+///
+/// Hook callbacks: `onRegister` registers pools that use this hook, so every distribution
+/// is attributable to a real Balancer v3 pool.
+///
+/// @dev Fee-on-transfer and rebasing tokens are not supported: Spraay pulls the exact gross amount.
+contract BatchDistributeHook is BaseHooks, VaultGuard, Ownable2Step, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    /// @notice Spraay enforces the same limit on-chain; checked here to fail early with a clear error
+    uint256 public constant MAX_RECIPIENTS = 200;
+
+    /// @notice Address of Spraay's batch distribution contract on this chain
+    ISpraay public spraay;
+
+    /// @notice Accounts allowed to trigger distributions
+    mapping(address => bool) public isOperator;
+
+    /// @notice Pools registered with this hook (Balancer v3 identifies pools by contract address)
+    mapping(address => bool) public isRegisteredPool;
+
+    event SpraayContractUpdated(address indexed oldSpraay, address indexed newSpraay);
+    event OperatorUpdated(address indexed operator, bool allowed);
+    event PoolRegistered(address indexed pool);
+    event BatchDistributed(
+        address indexed pool,
+        address indexed operator,
+        address indexed token,
+        uint256 recipientCount,
+        uint256 totalAmount,
+        uint256 feeAmount
+    );
+
+    error NotOperator();
+    error ZeroAddress();
+    error PoolNotRegistered();
+    error NoRecipients();
+    error TooManyRecipients(uint256 count, uint256 max);
+    error LengthMismatch();
+    error InsufficientNativeAmount(uint256 required, uint256 provided);
+    error UnexpectedNativeAmount();
+    error NativeTransferFailed();
+
+    modifier onlyOperator() {
+        if (!isOperator[msg.sender]) revert NotOperator();
+        _;
+    }
+
+    /// @param _vault The Balancer v3 Vault on this chain
+    /// @param _spraay Spraay's batch contract on this chain
+    /// @param _owner Admin account; passed explicitly because deployment may go through a factory
+    /// @param _operator Initial distribution operator (may be address(0) to set later)
+    constructor(IVault _vault, address _spraay, address _owner, address _operator)
+        VaultGuard(_vault)
+        Ownable(_owner)
+    {
+        if (_spraay == address(0)) revert ZeroAddress();
+        spraay = ISpraay(_spraay);
+        emit SpraayContractUpdated(address(0), _spraay);
+
+        if (_operator != address(0)) {
+            isOperator[_operator] = true;
+            emit OperatorUpdated(_operator, true);
+        }
+    }
+
+    // ============ Hook callbacks ============
+
+    /// @inheritdoc IHooks
+    function onRegister(
+        address,
+        address pool,
+        TokenConfig[] memory,
+        LiquidityManagement calldata
+    ) public override onlyVault returns (bool) {
+        isRegisteredPool[pool] = true;
+        emit PoolRegistered(pool);
+        return true;
+    }
+
+    /// @inheritdoc IHooks
+    function getHookFlags() public pure override returns (HookFlags memory) {
+        HookFlags memory hookFlags;
+        // No swap/liquidity callbacks needed — this hook only tracks pool registration
+        // and provides distribution as an external function.
+        return hookFlags;
+    }
+
+    // ============ Distribution ============
+
+    /// @notice Push-distribute variable amounts to many recipients in one transaction
+    /// @param pool Pool the distribution is attributed to (must use this hook)
+    /// @param token ERC-20 to distribute, or address(0) for the chain's native currency
+    /// @param recipients Recipient addresses (max 200)
+    /// @param amounts Amount for each recipient, excluding the Spraay fee
+    /// @dev ERC-20: operator must approve this hook for `quoteTotalCost(sum(amounts))`.
+    /// Native: msg.value must be at least `quoteTotalCost(sum(amounts))`; any excess is refunded.
+    function batchDistribute(
+        address pool,
+        address token,
+        address[] calldata recipients,
+        uint256[] calldata amounts
+    ) external payable nonReentrant onlyOperator {
+        _checkPoolAndRecipients(pool, recipients.length);
+        if (recipients.length != amounts.length) revert LengthMismatch();
+
+        ISpraay.Recipient[] memory batch = new ISpraay.Recipient[](recipients.length);
+        uint256 totalAmount = 0;
+        for (uint256 i; i < recipients.length; ++i) {
+            batch[i] = ISpraay.Recipient({recipient: payable(recipients[i]), amount: amounts[i]});
+            totalAmount += amounts[i];
+        }
+
+        ISpraay _spraay = spraay;
+        uint256 requiredAmount = _prepare(_spraay, token, totalAmount);
+        emit BatchDistributed(
+            pool, msg.sender, token, recipients.length, totalAmount, requiredAmount - totalAmount
+        );
+
+        if (token == address(0)) {
+            _spraay.sprayETH{value: requiredAmount}(batch);
+            _refundExcess(requiredAmount);
+        } else {
+            _pullAndApprove(token, address(_spraay), requiredAmount);
+            _spraay.sprayToken(token, batch);
+        }
+    }
+
+    /// @notice Push-distribute the same amount to every recipient in one transaction
+    /// @param pool Pool the distribution is attributed to (must use this hook)
+    /// @param token ERC-20 to distribute, or address(0) for the chain's native currency
+    /// @param recipients Recipient addresses (max 200)
+    /// @param amountEach Amount each recipient receives, excluding the Spraay fee
+    function batchDistributeEqual(
+        address pool,
+        address token,
+        address[] calldata recipients,
+        uint256 amountEach
+    ) external payable nonReentrant onlyOperator {
+        _checkPoolAndRecipients(pool, recipients.length);
+
+        address payable[] memory batch = new address payable[](recipients.length);
+        for (uint256 i; i < recipients.length; ++i) {
+            batch[i] = payable(recipients[i]);
+        }
+
+        ISpraay _spraay = spraay;
+        uint256 totalAmount = amountEach * recipients.length;
+        uint256 requiredAmount = _prepare(_spraay, token, totalAmount);
+        emit BatchDistributed(
+            pool, msg.sender, token, recipients.length, totalAmount, requiredAmount - totalAmount
+        );
+
+        if (token == address(0)) {
+            _spraay.sprayEqual{value: requiredAmount}(address(0), batch, amountEach);
+            _refundExcess(requiredAmount);
+        } else {
+            _pullAndApprove(token, address(_spraay), requiredAmount);
+            _spraay.sprayEqual(token, batch, amountEach);
+        }
+    }
+
+    /// @notice Amount (distribution + Spraay fee) an operator must provide to distribute `totalAmount`
+    function quoteTotalCost(uint256 totalAmount) external view returns (uint256) {
+        return spraay.calculateTotalCost(totalAmount);
+    }
+
+    /// @notice Return the Vault address this hook is associated with
+    function vault() external view returns (address) {
+        return address(_vault);
+    }
+
+    // ============ Admin ============
+
+    /// @notice Point the hook at a different Spraay deployment (e.g. after a Spraay upgrade)
+    function setSpraayContract(address newSpraay) external onlyOwner {
+        if (newSpraay == address(0)) revert ZeroAddress();
+        emit SpraayContractUpdated(address(spraay), newSpraay);
+        spraay = ISpraay(newSpraay);
+    }
+
+    function setOperator(address operator, bool allowed) external onlyOwner {
+        if (operator == address(0)) revert ZeroAddress();
+        isOperator[operator] = allowed;
+        emit OperatorUpdated(operator, allowed);
+    }
+
+    /// @notice Recover ERC-20s sent to the hook by mistake. The hook never holds funds between calls.
+    function rescueTokens(address token, address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        IERC20(token).safeTransfer(to, amount);
+    }
+
+    // ============ Internal ============
+
+    function _checkPoolAndRecipients(address pool, uint256 count) internal view {
+        if (!isRegisteredPool[pool]) revert PoolNotRegistered();
+        if (count == 0) revert NoRecipients();
+        if (count > MAX_RECIPIENTS) revert TooManyRecipients(count, MAX_RECIPIENTS);
+    }
+
+    /// @dev Quotes the gross amount (distribution + Spraay fee) and validates msg.value against it
+    function _prepare(ISpraay _spraay, address token, uint256 totalAmount)
+        internal
+        view
+        returns (uint256 requiredAmount)
+    {
+        requiredAmount = _spraay.calculateTotalCost(totalAmount);
+        if (token == address(0)) {
+            if (msg.value < requiredAmount) revert InsufficientNativeAmount(requiredAmount, msg.value);
+        } else if (msg.value != 0) {
+            revert UnexpectedNativeAmount();
+        }
+    }
+
+    function _refundExcess(uint256 requiredAmount) internal {
+        uint256 excess = msg.value - requiredAmount;
+        if (excess > 0) {
+            (bool success,) = msg.sender.call{value: excess}("");
+            if (!success) revert NativeTransferFailed();
+        }
+    }
+
+    function _pullAndApprove(address token, address spender, uint256 amount) internal {
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        IERC20(token).forceApprove(spender, amount);
+    }
+
+    /// @dev Accept native currency for distributions and refunds
+    receive() external payable {}
+}
